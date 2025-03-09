@@ -19,8 +19,8 @@ exports.nuevaInstalacionTiendaNube = functions.https.onRequest((req, res) => {
     }
 
     const data = JSON.stringify({
-      client_id: "9756",
-      client_secret: "92047fb27dc116d8b69a5814d70c3b5ddb5dfc9208614c04",
+      client_id: "16132",
+      client_secret: "232531c4b99e6a958849e3a5c78ca691bbce9d4c05837ab8",
       grant_type: "authorization_code",
       code: code,
     });
