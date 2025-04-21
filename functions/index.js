@@ -129,22 +129,26 @@ exports.webhookOrderPaid = functions.https.onRequest((req, res) => {
 
     try {
       // Verifica si el orderData.id ya existe en la colección "orders"
-      const orderRef = db.collection("orders").doc(orderData.id);
-      const orderSnapshot = await orderRef.get();
+      const ordersQuery = await db.collection("orders")
+          .where("id", "==", orderData.id)
+          .get();
 
-      if (orderSnapshot.exists) {
+      if (!ordersQuery.empty) {
         return res.status(400).json({
           messageCF: "La orden ya ha sido registrada previamente",
         });
       }
 
-      // Guarda toda la orden en la colección "orders"
-      await orderRef.set(orderData);
+      // Guarda toda la orden en la colección "orders" con un ID automático
+      await db.collection("orders").add({
+        ...orderData,
+      });
 
       res.status(200).json({
         messageCF: "Orden pagada recibida y guardada correctamente",
       });
     } catch (error) {
+      await db.collection("logs_firebase_functions").doc().set(error);
       res.status(500).json({
         messageCF: "Error al guardar la orden en Firestore",
         error: error.message,
