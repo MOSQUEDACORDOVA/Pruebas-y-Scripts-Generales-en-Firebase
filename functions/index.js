@@ -1,4 +1,4 @@
-const functions = require("firebase-functions");
+const functions = require("firebase-functions/v2");
 const admin = require("firebase-admin");
 
 const https = require("https");
@@ -13,7 +13,6 @@ const corsOptions = {
 };
 
 exports.nuevaInstalacionTiendaNube = functions.https.onRequest((req, res) => {
-  // Usa cors como middleware
   cors(corsOptions)(req, res, () => {
     const {code} = req.body;
 
@@ -54,7 +53,8 @@ exports.nuevaInstalacionTiendaNube = functions.https.onRequest((req, res) => {
             "Proceso de solicitud de token" :
             "Error al ejecutar la Cloud Function",
           respuesta: statusCode === 200 ?
-          JSON.parse(responseData) : responseData,
+            JSON.parse(responseData) :
+            responseData,
         };
         res.status(statusCode).json(jsonResponse);
       });
@@ -73,7 +73,6 @@ exports.nuevaInstalacionTiendaNube = functions.https.onRequest((req, res) => {
 });
 
 exports.obtenerProductosTiendaNube = functions.https.onRequest((req, res) => {
-  // Usa cors como middleware
   cors(corsOptions)(req, res, () => {
     const {token} = req.body;
 
@@ -125,11 +124,10 @@ exports.webhookOrderPaid = functions.https.onRequest((req, res) => {
   cors(corsOptions)(req, res, async () => {
     const orderData = req.body;
 
-    // TEST await db.collection("logs_firebase_functions").doc().set(orderData);
-
     try {
-      // Verifica si el orderData.id ya existe en la colección "orders"
-      const ordersQuery = await db.collection("orders")
+    // TEST await db.collection("logs_firebase_functions").doc().set(orderData);
+      const ordersQuery = await db
+          .collection("orders")
           .where("id", "==", orderData.id)
           .get();
 
@@ -139,20 +137,128 @@ exports.webhookOrderPaid = functions.https.onRequest((req, res) => {
         });
       }
 
-      // Guarda toda la orden en la colección "orders" con un ID automático
       await db.collection("orders").add({
         ...orderData,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
+      // Respuesta exitosa
       res.status(200).json({
-        messageCF: "Orden pagada recibida y guardada correctamente",
+        messageCF: "Orden procesada y registrada exitosamente",
       });
     } catch (error) {
-      await db.collection("logs_firebase_functions").doc().set(error);
+      await db.collection("logs_firebase_functions").doc().set({
+        error: error.message,
+        stack: error.stack,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
       res.status(500).json({
-        messageCF: "Error al guardar la orden en Firestore",
+        messageCF: "Error al procesar la orden",
         error: error.message,
       });
     }
   });
 });
+
+exports.detectarNuevoDocumentoEnOrders = functions.firestore.onDocumentCreated(
+    "orders/{orderId}",
+    async (event) => {
+      try {
+        const orderData = event.data.data();
+
+        // Buscar la tienda asociada al store_id
+        const tiendaDoc = await db
+            .collection("tiendas")
+            .where("user_id", "==", orderData.store_id)
+            .limit(1)
+            .get();
+
+        if (tiendaDoc.empty) {
+          console.error("No se encontró la tienda asociada al store_id");
+          return;
+        }
+
+        const tiendaData = tiendaDoc.docs[0].data();
+        const tiendaToken = tiendaData.token;
+
+        const options = {
+          hostname: "api.tiendanube.com",
+          path: `/v1/${orderData.store_id}/orders/${orderData.id}`,
+          method: "GET",
+          headers: {
+            "Authentication": `bearer ${tiendaToken}`,
+            "User-Agent": "SistemaNube/1.0",
+          },
+        };
+
+        const request = https.request(options, (response) => {
+          let responseData = "";
+
+          response.on("data", (chunk) => {
+            responseData += chunk;
+          });
+
+          response.on("end", async () => {
+            if (response.statusCode === 200) {
+              const orderDetails = JSON.parse(responseData);
+
+              const clienteRef = await (async () => {
+                const clienteQuery = await db.collection("clientes")
+                    .where("LsCustomer", "==", orderDetails.customer.id)
+                    .limit(1)
+                    .get();
+                return clienteQuery.empty ? null : clienteQuery.docs[0].ref;
+              })();
+
+              await db.collection("historial_puntos").add({
+                puntos: orderDetails.total * tiendaData.equivalencia_puntos,
+                tienda: tiendaDoc.docs[0].ref,
+                cliente: clienteRef,
+                tipo: true,
+                order_id: orderDetails.id,
+                orden: event.data.ref,
+                equivalencia: tiendaData.equivalencia_puntos,
+              });
+
+              // Agregar puntos al cliente
+              if (clienteRef) {
+                await clienteRef.update({
+                  puntos: admin.firestore.FieldValue.increment(
+                      orderDetails.total * tiendaData.equivalencia_puntos,
+                  ),
+                });
+              }
+
+              // Actualización de la orden
+              await event.data.ref.update({
+                total: orderDetails.total,
+                customer_id: orderDetails.customer.id,
+                tienda: tiendaDoc.docs[0].ref,
+                cliente: clienteRef,
+              });
+            } else {
+              console.error("Error al obtener el total de la orden", {
+                token: tiendaToken,
+                respuesta: responseData,
+              });
+            }
+          });
+        });
+
+        request.on("error", async (error) => {
+          await db.collection("logs_firebase_functions").doc().set({
+            error: error.message,
+            stack: error.stack,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.error("Error al procesar la orden", error.message);
+        });
+
+        request.end();
+      } catch (error) {
+        console.error(
+            `Error en detectarNuevoDocumentoEnOrders: ${error.message}`,
+        );
+      }
+    },
+);

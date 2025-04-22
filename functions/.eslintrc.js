@@ -4,7 +4,7 @@ module.exports = {
     node: true,
   },
   parserOptions: {
-    "ecmaVersion": 2018,
+    ecmaVersion: 2018, // Sin comillas para mantener consistencia
   },
   extends: [
     "eslint:recommended",
@@ -12,8 +12,9 @@ module.exports = {
   ],
   rules: {
     "no-restricted-globals": ["error", "name", "length"],
+    // Revisa si estas restricciones son necesarias
     "prefer-arrow-callback": "error",
-    "quotes": ["error", "double", {"allowTemplateLiterals": true}],
+    "quotes": ["error", "double", {allowTemplateLiterals: true}],
   },
   overrides: [
     {
@@ -21,8 +22,10 @@ module.exports = {
       env: {
         mocha: true,
       },
-      rules: {},
+      rules: {
+        // Puedes agregar reglas específicas aquí si es necesario
+      },
     },
   ],
-  globals: {},
+  globals: {}, // Agrega variables globales aquí si las necesitas
 };
