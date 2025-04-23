@@ -218,6 +218,8 @@ exports.detectarNuevoDocumentoEnOrders = functions.firestore.onDocumentCreated(
                 order_id: orderDetails.id,
                 orden: event.data.ref,
                 equivalencia: tiendaData.equivalencia_puntos,
+                motivoExterno: "Hiciste una compra",
+                motivoInterno: "Hizo una compra",
               });
 
               // Agregar puntos al cliente
@@ -236,6 +238,41 @@ exports.detectarNuevoDocumentoEnOrders = functions.firestore.onDocumentCreated(
                 tienda: tiendaDoc.docs[0].ref,
                 cliente: clienteRef,
               });
+
+              // Verificar si existe un cupón en la orden
+              if (orderDetails.coupon && orderDetails.coupon.id) {
+                const cuponQuery = await db.collection("cupones")
+                    .where("IDCuponTiendaNube", "==", orderDetails.coupon.id)
+                    .limit(1)
+                    .get();
+                if (!cuponQuery.empty) {
+                  const puntosDescontar =
+                    orderDetails.coupon.value *
+                    tiendaData.equivalencia_puntos;
+
+                  // Descontar puntos al cliente
+                  if (clienteRef) {
+                    await clienteRef.update({
+                      puntos: admin.firestore.FieldValue.increment(
+                          -puntosDescontar),
+                    });
+
+                    // Registrar el descuento en el historial de puntos
+                    await db.collection("historial_puntos").add({
+                      puntos: -puntosDescontar,
+                      tienda: tiendaDoc.docs[0].ref,
+                      cliente: clienteRef,
+                      tipo: false, // Indica que es un descuento
+                      order_id: orderDetails.id,
+                      orden: event.data.ref,
+                      equivalencia: tiendaData.equivalencia_puntos,
+                      motivoExterno: "Aplicaste un cupón",
+                      motivoInterno: `Aplicó el cupon: ` +
+                        `${orderDetails.coupon.id}`,
+                    });
+                  }
+                }
+              }
             } else {
               console.error("Error al obtener el total de la orden", {
                 token: tiendaToken,
