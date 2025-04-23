@@ -196,6 +196,7 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
           equivalencia: tiendaData.equivalencia_puntos,
           motivoExterno: "Hiciste una compra",
           motivoInterno: "Hizo una compra",
+          fecha: admin.firestore.FieldValue.serverTimestamp(),
         });
 
         // Agregar puntos al cliente
@@ -240,7 +241,7 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
                     "Si tiene IDCuponTiendaNube"});
 
               const puntosDescontar =
-                orderDetails.coupon[0].value * tiendaData.equivalencia_puntos;
+                orderDetails.coupon[0].value / tiendaData.equivalencia_puntos;
 
               await db.collection("logs_firebase_functions")
                   .doc().set({
@@ -265,6 +266,7 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
                   equivalencia: tiendaData.equivalencia_puntos,
                   motivoExterno: "Aplicaste un cupón",
                   motivoInterno: `Aplicó el cupón: ${couponId}`,
+                  fecha: admin.firestore.FieldValue.serverTimestamp(),
                 });
               }
             }
