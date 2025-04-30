@@ -236,40 +236,19 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
                 .where("IDCuponTiendaNube", "==", couponId.toString())
                 .limit(1)
                 .get();
-            if (!cuponQuery.empty) {
-              await db.collection("logs_firebase_functions")
-                  .doc().set({message:
-                    "Si tiene IDCuponTiendaNube"});
 
-              const puntosDescontar =
-                orderDetails.coupon[0].value / tiendaData.canje_puntos;
+            if (!cuponQuery.empty) {
+              const cuponDocRef = cuponQuery.docs[0].ref;
+              await cuponDocRef.update({
+                estado: true,
+              });
 
               await db.collection("logs_firebase_functions")
                   .doc().set({
-                    message: "Si tiene IDCuponTiendaNube",
-                    IDCuponTiendaNube: couponId,
-                    puntosDescontar: puntosDescontar});
-              // Descontar puntos al cliente
-              if (clienteRef) {
-                await clienteRef.update({
-                  puntos: admin.firestore.FieldValue.increment(
-                      -puntosDescontar),
-                });
-
-                // Registrar el descuento en el historial de puntos
-                await db.collection("historial_puntos").add({
-                  puntos: puntosDescontar,
-                  tienda: tiendaDoc.docs[0].ref,
-                  cliente: clienteRef,
-                  tipo: false, // Indica que es un descuento
-                  order_id: orderDetails.id,
-                  orden: event.data.ref,
-                  equivalencia: tiendaData.equivalencia_puntos,
-                  motivoExterno: "Aplicaste un cupón",
-                  motivoInterno: `Aplicó el cupón: ${couponId}`,
-                  fecha: admin.firestore.FieldValue.serverTimestamp(),
-                });
-              }
+                    message:
+                        "Si tiene IDCuponTiendaNube y se actualizó el estado " +
+                        "a true",
+                  });
             }
           }
         } else {
