@@ -187,14 +187,14 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
         })();
 
         await db.collection("historial_puntos").add({
-          puntos: orderDetails.total * tiendaData.canje_puntos,
+          puntos: orderDetails.total * tiendaData.equivalencia_puntos,
           tienda: tiendaDoc.docs[0].ref,
           cliente: clienteRef,
           tipo: true,
           order_id: orderDetails.id,
           orden: event.data.ref,
           canje: tiendaData.canje_puntos,
-          equivalencia: tiendaData.canje_puntos,
+          equivalencia: tiendaData.equivalencia_puntos,
           motivoExterno: "Hiciste una compra",
           motivoInterno: "Hizo una compra",
           fecha: admin.firestore.FieldValue.serverTimestamp(),
@@ -204,7 +204,7 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
         if (clienteRef) {
           await clienteRef.update({
             puntos: admin.firestore.FieldValue.increment(
-                orderDetails.total * tiendaData.canje_puntos,
+                orderDetails.total * tiendaData.equivalencia_puntos,
             ),
           });
         }
