@@ -187,13 +187,14 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
         })();
 
         await db.collection("historial_puntos").add({
-          puntos: orderDetails.total * tiendaData.equivalencia_puntos,
+          puntos: orderDetails.total * tiendaData.canje_puntos,
           tienda: tiendaDoc.docs[0].ref,
           cliente: clienteRef,
           tipo: true,
           order_id: orderDetails.id,
           orden: event.data.ref,
-          equivalencia: tiendaData.equivalencia_puntos,
+          canje: tiendaData.canje_puntos,
+          equivalencia: tiendaData.canje_puntos,
           motivoExterno: "Hiciste una compra",
           motivoInterno: "Hizo una compra",
           fecha: admin.firestore.FieldValue.serverTimestamp(),
@@ -203,7 +204,7 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
         if (clienteRef) {
           await clienteRef.update({
             puntos: admin.firestore.FieldValue.increment(
-                orderDetails.total * tiendaData.equivalencia_puntos,
+                orderDetails.total * tiendaData.canje_puntos,
             ),
           });
         }
@@ -241,7 +242,7 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
                     "Si tiene IDCuponTiendaNube"});
 
               const puntosDescontar =
-                orderDetails.coupon[0].value / tiendaData.equivalencia_puntos;
+                orderDetails.coupon[0].value / tiendaData.canje_puntos;
 
               await db.collection("logs_firebase_functions")
                   .doc().set({
@@ -300,6 +301,83 @@ exports.webhookOrderPaid = functions.https.onRequest((req, res) => {
     const orderData = req.body;
 
     try {
+      // Obtener el token de la tienda desde Firestore
+      const tiendaDoc = await db
+          .collection("tiendas")
+          .where("user_id", "==", orderData.store_id.toString())
+          .limit(1)
+          .get();
+
+      if (tiendaDoc.empty) {
+        await db.collection("logs_firebase_functions")
+            .doc().set({message: "No se encontró la tienda"});
+
+        return res.status(400).json({
+          messageCF: "No se encontró la tienda asociada al store_id",
+        });
+      }
+
+      const tiendaData = tiendaDoc.docs[0].data();
+      const tiendaToken = tiendaData.token;
+
+      // Consultar los detalles de la orden desde la API de Tienda Nube
+      const options = {
+        hostname: "api.tiendanube.com",
+        path: `/v1/${orderData.store_id}/orders/${orderData.id}`,
+        method: "GET",
+        headers: {
+          "Authentication": `bearer ${tiendaToken}`,
+          "User-Agent": "SistemaNube/1.0",
+        },
+      };
+
+      const orderDetails = await new Promise((resolve, reject) => {
+        const request = https.request(options, async (response) => {
+          let responseData = "";
+
+          response.on("data", (chunk) => {
+            responseData += chunk;
+          });
+
+          response.on("end", async () => {
+            if (response.statusCode === 200) {
+              resolve(JSON.parse(responseData));
+            } else {
+              await db.collection("logs_firebase_functions")
+                  .doc().set({
+                    message: "Error al obtener los detalles de la orden",
+                  });
+
+              reject(new Error(`Error al obtener los detalles de la orden: 
+                ${responseData}`));
+            }
+          });
+        });
+
+        request.on("error", (error) => {
+          reject(error);
+        });
+
+        request.end();
+      });
+
+      // Validar si el cliente ya está registrado en la colección "clientes"
+      const clienteQuery = await db.collection("clientes")
+          .where("LsCustomer", "==", orderDetails.customer.id)
+          .limit(1)
+          .get();
+
+      if (clienteQuery.empty) {
+        await db.collection("logs_firebase_functions")
+            .doc().set({
+              message: "El cliente no está registrado en el sistema",
+            });
+
+        return res.status(400).json({
+          messageCF: "El cliente no está registrado en el sistema",
+        });
+      }
+
       // Verificar si la orden ya existe
       const ordersQuery = await db
           .collection("orders")
