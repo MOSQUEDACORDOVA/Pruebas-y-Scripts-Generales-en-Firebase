@@ -120,6 +120,202 @@ exports.obtenerProductosTiendaNube = functions.https.onRequest((req, res) => {
   });
 });
 
+// Evaluar el nivel del cliente
+/**
+ * Evalúa el nivel del cliente basado en el total gastado
+ * en los últimos 30 días.
+ *
+ * @param {FirebaseFirestore.DocumentReference} clienteRef
+ * Referencia al documento del cliente en Firestore.
+ * @param {FirebaseFirestore.DocumentReference} tiendaRef
+ * Referencia al documento de la tienda en Firestore.
+ */
+async function evaluarNivel(clienteRef, tiendaRef) {
+  const ahora = new Date();
+  const desde = new Date();
+  desde.setDate(ahora.getDate() - 30); // ventana de 30 días
+
+  try {
+    // Registrar inicio de la función
+    await db.collection("logs_firebase_functions").doc().set({
+      message: "Inicio de evaluarNivel",
+      clienteRef: clienteRef.id,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // 1. Traer órdenes en ese rango
+    const ordenesSnap = await db.collection("ordenes")
+        .where("cliente", "==", clienteRef)
+        .where("fecha", ">=", desde)
+        .get();
+
+    let totalGastado = 0;
+    ordenesSnap.forEach((doc) => {
+      const total = Number(doc.data().total);
+      totalGastado += !isNaN(total) ? total : 0;
+    });
+
+    // Registrar total gastado
+    await db.collection("logs_firebase_functions").doc().set({
+      message: "Total gastado calculado",
+      totalGastado: totalGastado,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // 2. Determinar nivel según totalGastado
+    let nuevoNivel = "standard"; // Valor predeterminado
+    let procentajeBeneficio = 0;
+
+    const nivelesSnap = await db.collection("niveles")
+        .where("Tienda", "==", tiendaRef)
+        .orderBy("GastoMinimo", "desc") // Ordenar por monto de mayor a menor
+        .get();
+
+    const expiresAt = new Date();
+
+    if (!nivelesSnap.empty) {
+      for (const nivelDoc of nivelesSnap.docs) {
+        const nivelData = nivelDoc.data();
+
+        if (totalGastado >= nivelData.GastoMinimo) {
+          await db.collection("logs_firebase_functions").doc().set({
+            message: "Si detecta el Total gastado calculado",
+            totalGastado: totalGastado,
+            nivelDetectado: nivelDoc.id,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          nuevoNivel = nivelDoc.ref;
+          procentajeBeneficio = nivelDoc.procentaje_beneficio;
+
+          // Calcular la expiración del nivel
+          const tipo = nivelData.vencimiento_tipo_frecuencia;
+          const cantidad = nivelData.vencimiento_frecuencia;
+
+          if (tipo === 1) {
+            expiresAt.setMonth(expiresAt.getMonth() + cantidad);
+          } else if (tipo === 2) {
+            expiresAt.setFullYear(expiresAt.getFullYear() + cantidad);
+          }
+
+          break; // Salir del bucle una vez encontrado el nivel
+        }
+      }
+    }
+
+    // Registrar nivel determinado
+    await db.collection("logs_firebase_functions").doc().set({
+      message: "Nivel determinado",
+      nuevoNivel: nuevoNivel,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Si no se cumple ninguna condición, eliminar el campo "nivel"
+    if (nuevoNivel === "standard") {
+      await clienteRef.update({
+        nivel: admin.firestore.FieldValue.delete(),
+        vencimiento_nivel: admin.firestore.FieldValue.delete(),
+      });
+    } else {
+      await clienteRef.update({
+        nivel: nuevoNivel,
+        vencimiento_nivel: expiresAt,
+      });
+
+      // Generar un cupón de descuento en Tienda Nube
+      try {
+        const tiendaData = await tiendaRef.get();
+        const tiendaUserId = tiendaData.data().user_id;
+
+        const couponData = JSON.stringify({
+          code: await generarCuponUnico(), // Generar un código único
+          type: "percentage",
+          value: procentajeBeneficio,
+          start_date: new Date().toISOString().split("T")[0],
+          end_date: expiresAt.toISOString().split("T")[0],
+        });
+
+        const options = {
+          hostname: "api.tiendanube.com",
+          path: `/v1/${tiendaUserId}/coupons`,
+          method: "POST",
+          headers: {
+            "Authentication": `bearer ${tiendaData.data().token}`,
+            "Content-Type": "application/json",
+            "User-Agent": "SistemaNube/1.0",
+            "Content-Length": couponData.length,
+          },
+        };
+
+        const request = https.request(options, (response) => {
+          let responseData = "";
+
+          response.on("data", (chunk) => {
+            responseData += chunk;
+          });
+
+          response.on("end", async () => {
+            if (response.statusCode === 201) {
+              const couponResponse = JSON.parse(responseData);
+              await clienteRef.update({
+                cupon_nivel: couponResponse.id,
+              });
+
+              await db.collection("logs_firebase_functions").doc().set({
+                message: "Cupón generado exitosamente",
+                clienteRef: clienteRef.id,
+                cuponId: couponResponse.id,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            } else {
+              console.error("Error al generar el cupón:", responseData);
+              await db.collection("logs_firebase_functions").doc().set({
+                message: "Error al generar el cupón:",
+                responseData: responseData,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            }
+          });
+        });
+
+        request.on("error", (error) => {
+          console.error("Error en la solicitud de cupón:", error.message);
+        });
+
+        request.write(couponData);
+        request.end();
+      } catch (error) {
+        console.error("Error al generar el cupón:", error.message);
+        await db.collection("logs_firebase_functions").doc().set({
+          message: "Error al generar el cupón",
+          error: error.message,
+          stack: error.stack,
+          clienteRef: clienteRef.id,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      // Registrar actualización del cliente
+      await db.collection("logs_firebase_functions").doc().set({
+        message: "Cliente actualizado con nuevo nivel",
+        clienteRef: clienteRef.id,
+        nivel: nuevoNivel.id,
+        vencimiento_nivel: expiresAt,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    // Registrar error
+    await db.collection("logs_firebase_functions").doc().set({
+      message: "Error en evaluarNivel",
+      error: error.message,
+      stack: error.stack,
+      clienteRef: clienteRef.id,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.error("Error en evaluarNivel:", error);
+  }
+}
+
 /**
  * Procesa un nuevo documento en la colección "orders".
  *
@@ -211,12 +407,13 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
 
         // Actualización de la orden
         await event.data.ref.update({
-          total: orderDetails.total,
+          total: Number(orderDetails.total),
           customer_id: orderDetails.customer.id,
           tienda: tiendaDoc.docs[0].ref,
           cliente: clienteRef,
         });
 
+        // Verificar uso de cupon
         if (
           Array.isArray(orderDetails.coupon) &&
           orderDetails.coupon.length > 0
@@ -254,6 +451,8 @@ async function procesarNuevoDocumentoEnOrders(event, orderId, storeId) {
         } else {
           console.warn("No se detectó un cupón válido en la orden.");
         }
+
+        await evaluarNivel(clienteRef, tiendaDoc.docs[0].ref);
       } else {
         console.error("Error al obtener el total de la orden", {
           token: tiendaToken,
@@ -359,7 +558,7 @@ exports.webhookOrderPaid = functions.https.onRequest((req, res) => {
 
       // Verificar si la orden ya existe
       const ordersQuery = await db
-          .collection("orders")
+          .collection("ordenes")
           .where("id", "==", orderData.id)
           .get();
 
@@ -370,9 +569,9 @@ exports.webhookOrderPaid = functions.https.onRequest((req, res) => {
       }
 
       // Agregar la nueva orden y obtener la referencia del documento
-      const docRef = await db.collection("orders").add({
+      const docRef = await db.collection("ordenes").add({
         ...orderData,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        fecha: admin.firestore.FieldValue.serverTimestamp(),
       });
 
       // Obtener el documento recién creado
@@ -400,6 +599,161 @@ exports.webhookOrderPaid = functions.https.onRequest((req, res) => {
         messageCF: "Error al procesar la orden",
         error: error.message,
       });
+    }
+  });
+});
+
+exports.calcularFaltanteNivel = functions.https.onRequest(async (req, res) => {
+  cors(corsOptions)(req, res, async () => {
+    const {clienteId, tiendaId} = req.body;
+
+    if (!clienteId || !tiendaId) {
+      return res.status(400).json({
+        messageCF: "Los parámetros 'clienteId' y 'tiendaId' son obligatorios",
+      });
+    }
+
+    try {
+      const clienteRef = db.collection("clientes").doc(clienteId);
+      const tiendaRef = db.collection("tiendas").doc(tiendaId);
+
+      const ahora = new Date();
+      const desde = new Date();
+      desde.setDate(ahora.getDate() - 30); // Últimos 30 días
+
+      // Obtener órdenes del cliente en los últimos 30 días
+      const ordenesSnap = await db.collection("ordenes")
+          .where("cliente", "==", clienteRef)
+          .where("fecha", ">=", desde)
+          .get();
+
+      let totalGastado = 0;
+      ordenesSnap.forEach((doc) => {
+        const total = Number(doc.data().total);
+        totalGastado += !isNaN(total) ? total : 0;
+      });
+
+      // Obtener niveles de la tienda
+      const nivelesSnap = await db.collection("niveles")
+          .where("Tienda", "==", tiendaRef)
+          .orderBy("GastoMinimo", "asc") // Ordenar de menor a mayor
+          .get();
+
+      if (nivelesSnap.empty) {
+        return res.status(404).json({
+          messageCF: "No se encontraron niveles para la tienda especificada",
+        });
+      }
+
+      let faltante = null;
+      let siguienteNivel = null;
+      for (const nivelDoc of nivelesSnap.docs) {
+        const nivelData = nivelDoc.data();
+        if (totalGastado < nivelData.GastoMinimo) {
+          faltante = nivelData.GastoMinimo - totalGastado;
+          siguienteNivel = nivelData.Titulo; // Obtener el nombre del nivel
+          break;
+        }
+      }
+
+      if (faltante === null) {
+        return res.status(200).json({
+          messageCF: "El cliente ya ha alcanzado el nivel más alto",
+          faltante: 0,
+          siguienteNivel: "Ninguno", // No hay nivel siguiente
+        });
+      }
+
+      res.status(200).json({
+        messageCF: "Cálculo realizado con éxito",
+        totalGastado,
+        faltante,
+        siguienteNivel,
+      });
+    } catch (error) {
+      await db.collection("logs_firebase_functions").doc().set({
+        message: "Error en calcularFaltanteNivel",
+        error: error.message,
+        stack: error.stack,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      res.status(500).json({
+        messageCF: "Error al calcular el faltante para el siguiente nivel",
+        error: error.message,
+      });
+    }
+  });
+});
+
+/**
+ * Generates a random block of uppercase letters of a specified length.
+ *
+ * @param {number} [length=3] - The length of the random block.
+ * @return {string} A string containing random uppercase letters.
+ */
+function randomBlock(length = 3) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let result = "";
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+/**
+ * Generates a unique coupon code consisting of three random blocks
+ * of uppercase letters.
+ *
+ * @return {string} A string in the format "XXX-XXX-XXX"
+ * where X is a random uppercase letter.
+ */
+function generateCouponCode() {
+  return `${randomBlock()}-${randomBlock()}-${randomBlock()}`;
+}
+
+/**
+ * Genera un código de cupón único y lo guarda en Firestore.
+ *
+ * @return {Promise<string>} El código de cupón único generado.
+ * @throws {Error} Si no se puede generar un cupón único
+ * después de varios intentos.
+ */
+async function generarCuponUnico() {
+  let codigoUnico = "";
+  let intentos = 0;
+  const maxIntentos = 10;
+
+  while (intentos < maxIntentos) {
+    const nuevoCodigo = generateCouponCode();
+    const docRef = db.collection("codigo_cupones").doc(nuevoCodigo);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      await docRef.set({
+        fecha: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      codigoUnico = nuevoCodigo;
+      break;
+    }
+
+    intentos++;
+  }
+
+  if (!codigoUnico) {
+    throw new Error("No se pudo generar un cupón único");
+  }
+
+  return codigoUnico;
+}
+
+exports.generarCuponUnico = functions.https.onRequest((req, res) => {
+  cors(corsOptions)(req, res, async () => {
+    try {
+      const cupon = await generarCuponUnico();
+      return res.status(200).json({cupon});
+    } catch (error) {
+      console.error("Error generando cupón:", error);
+      return res.status(500).json({error: "Error del servidor"});
     }
   });
 });
