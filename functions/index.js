@@ -48,15 +48,35 @@ exports.nuevaInstalacionTiendaNube = functions.https.onRequest((req, res) => {
 
       response.on("end", () => {
         const statusCode = response.statusCode;
-        const jsonResponse = {
-          messageCF: statusCode === 200 ?
-            "Proceso de solicitud de token" :
-            "Error al ejecutar la Cloud Function",
-          respuesta: statusCode === 200 ?
-            JSON.parse(responseData) :
-            responseData,
-        };
-        res.status(statusCode).json(jsonResponse);
+        if (statusCode === 200) {
+          const tokenData = JSON.parse(responseData);
+
+          // Crear webhook automáticamente después de obtener el token
+          crearWebhookTiendaNube(tokenData.access_token, tokenData.user_id)
+              .then((webhookResult) => {
+                const jsonResponse = {
+                  messageCF: "Token y webhook creados exitosamente",
+                  respuesta: tokenData,
+                  webhook: webhookResult,
+                };
+                res.status(statusCode).json(jsonResponse);
+              })
+              .catch((webhookError) => {
+                console.error("Error al crear webhook:", webhookError);
+                const jsonResponse = {
+                  messageCF: "Token obtenido pero error al crear webhook",
+                  respuesta: tokenData,
+                  webhookError: webhookError.message,
+                };
+                res.status(statusCode).json(jsonResponse);
+              });
+        } else {
+          const jsonResponse = {
+            messageCF: "Error al ejecutar la Cloud Function",
+            respuesta: responseData,
+          };
+          res.status(statusCode).json(jsonResponse);
+        }
       });
     });
 
@@ -185,7 +205,7 @@ async function evaluarNivel(clienteRef, tiendaRef) {
             timestamp: admin.firestore.FieldValue.serverTimestamp(),
           });
           nuevoNivel = nivelDoc.ref;
-          procentajeBeneficio = nivelDoc.procentaje_beneficio;
+          procentajeBeneficio = nivelData.procentaje_beneficio;
 
           // Calcular la expiración del nivel
           const tipo = nivelData.vencimiento_tipo_frecuencia;
@@ -216,9 +236,12 @@ async function evaluarNivel(clienteRef, tiendaRef) {
         vencimiento_nivel: admin.firestore.FieldValue.delete(),
       });
     } else {
+      const codigoCupon = await generarCuponUnico(); // Generar un código único
+
       await clienteRef.update({
         nivel: nuevoNivel,
         vencimiento_nivel: expiresAt,
+        cupon_nivel: codigoCupon, // Usar el mismo código generado
       });
 
       // Generar un cupón de descuento en Tienda Nube
@@ -227,7 +250,7 @@ async function evaluarNivel(clienteRef, tiendaRef) {
         const tiendaUserId = tiendaData.data().user_id;
 
         const couponData = JSON.stringify({
-          code: await generarCuponUnico(), // Generar un código único
+          code: codigoCupon, // Usar el mismo código generado
           type: "percentage",
           value: procentajeBeneficio,
           start_date: new Date().toISOString().split("T")[0],
@@ -255,15 +278,10 @@ async function evaluarNivel(clienteRef, tiendaRef) {
 
           response.on("end", async () => {
             if (response.statusCode === 201) {
-              const couponResponse = JSON.parse(responseData);
-              await clienteRef.update({
-                cupon_nivel: couponResponse.id,
-              });
-
               await db.collection("logs_firebase_functions").doc().set({
                 message: "Cupón generado exitosamente",
-                clienteRef: clienteRef.id,
-                cuponId: couponResponse.id,
+                clienteRef: clienteRef,
+                cuponId: codigoCupon,
                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
               });
             } else {
@@ -746,6 +764,56 @@ async function generarCuponUnico() {
   return codigoUnico;
 }
 
+/**
+ * Crea un webhook en Tienda Nube para el evento order/paid
+ * @param {string} accessToken - Token de acceso para la API de Tienda Nube
+ * @param {string} userId - ID del usuario de la tienda
+ * @return {Promise<Object>} Resultado de la creación del webhook
+ */
+async function crearWebhookTiendaNube(accessToken, userId) {
+  return new Promise((resolve, reject) => {
+    const webhookData = JSON.stringify({
+      event: "order/paid",
+      url: "https://webhookorderpaid-txl6s4cyeq-uc.a.run.app",
+    });
+
+    const options = {
+      hostname: "api.tiendanube.com",
+      path: `/v1/${userId}/webhooks`,
+      method: "POST",
+      headers: {
+        "Authentication": `bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "User-Agent": "SistemaNube/1.0",
+        "Content-Length": webhookData.length,
+      },
+    };
+
+    const request = https.request(options, (response) => {
+      let responseData = "";
+
+      response.on("data", (chunk) => {
+        responseData += chunk;
+      });
+
+      response.on("end", () => {
+        if (response.statusCode === 201) {
+          resolve(JSON.parse(responseData));
+        } else {
+          reject(new Error(`Error al crear webhook: ${responseData}`));
+        }
+      });
+    });
+
+    request.on("error", (error) => {
+      reject(error);
+    });
+
+    request.write(webhookData);
+    request.end();
+  });
+}
+
 exports.generarCuponUnico = functions.https.onRequest((req, res) => {
   cors(corsOptions)(req, res, async () => {
     try {
@@ -754,6 +822,106 @@ exports.generarCuponUnico = functions.https.onRequest((req, res) => {
     } catch (error) {
       console.error("Error generando cupón:", error);
       return res.status(500).json({error: "Error del servidor"});
+    }
+  });
+});
+
+exports.crearCuponTiendaNube = functions.https.onRequest((req, res) => {
+  cors(corsOptions)(req, res, async () => {
+    const {storeId, value, startDate, endDate} = req.body;
+
+    // Validar parámetros obligatorios
+    if (!storeId || !value || !startDate || !endDate) {
+      return res.status(400).json({
+        messageCF: "Los parámetros 'storeId', 'value', " +
+          "'startDate' y 'endDate' son obligatorios",
+      });
+    }
+
+    try {
+      // Obtener el token de la tienda desde Firestore
+      const tiendaDoc = await db
+          .collection("tiendas")
+          .where("user_id", "==", storeId.toString())
+          .limit(1)
+          .get();
+
+      if (tiendaDoc.empty) {
+        return res.status(404).json({
+          messageCF: "No se encontró la tienda asociada al storeId",
+        });
+      }
+
+      const tiendaData = tiendaDoc.docs[0].data();
+      const token = tiendaData.token;
+
+      // Generar código único de cupón
+      const codigoCupon = await generarCuponUnico();
+
+      // Datos del cupón para la API
+      const couponData = JSON.stringify({
+        code: codigoCupon,
+        type: "absolute",
+        value: value,
+        max_uses: 1,
+        start_date: startDate,
+        end_date: endDate,
+      });
+
+      const options = {
+        hostname: "api.tiendanube.com",
+        path: `/v1/${storeId}/coupons`,
+        method: "POST",
+        headers: {
+          "Authentication": `bearer ${token}`,
+          "Content-Type": "application/json",
+          "User-Agent": "SistemaNube/1.0",
+          "Content-Length": couponData.length,
+        },
+      };
+
+      // Realizar la petición HTTP
+      const request = https.request(options, (response) => {
+        let responseData = "";
+
+        response.on("data", (chunk) => {
+          responseData += chunk;
+        });
+
+        response.on("end", () => {
+          if (response.statusCode === 201) {
+            const cuponCreado = JSON.parse(responseData);
+            res.status(201).json({
+              messageCF: "Cupón creado exitosamente",
+              cupon: cuponCreado,
+              codigoGenerado: codigoCupon,
+            });
+          } else {
+            console.error("Error al crear el cupón:", responseData);
+            res.status(response.statusCode).json({
+              messageCF: "Error al crear el cupón en Tienda Nube",
+              error: responseData,
+            });
+          }
+        });
+      });
+
+      request.on("error", (error) => {
+        console.error("Error en la solicitud:", error);
+        res.status(500).json({
+          messageCF: "Error en la solicitud HTTP",
+          error: error.message,
+        });
+      });
+
+      request.write(couponData);
+      request.end();
+    } catch (error) {
+      console.error("Error generando cupón:", error);
+      res.status(500).json({
+        messageCF: "Error del servidor",
+        error: error.message,
+      });
     }
   });
 });
