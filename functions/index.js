@@ -814,18 +814,6 @@ async function crearWebhookTiendaNube(accessToken, userId) {
   });
 }
 
-exports.generarCuponUnico = functions.https.onRequest((req, res) => {
-  cors(corsOptions)(req, res, async () => {
-    try {
-      const cupon = await generarCuponUnico();
-      return res.status(200).json({cupon});
-    } catch (error) {
-      console.error("Error generando cupón:", error);
-      return res.status(500).json({error: "Error del servidor"});
-    }
-  });
-});
-
 exports.crearCuponTiendaNube = functions.https.onRequest((req, res) => {
   cors(corsOptions)(req, res, async () => {
     const {storeId, value, startDate, endDate} = req.body;
@@ -838,7 +826,27 @@ exports.crearCuponTiendaNube = functions.https.onRequest((req, res) => {
       });
     }
 
+    /**
+     * Convierte una fecha del formato DD-M-YYYY a YYYY-MM-DD
+     * @param {string} dateString - Fecha en formato DD-M-YYYY
+     * @return {string} Fecha en formato YYYY-MM-DD
+     */
+    function formatDateForAPI(dateString) {
+      const parts = dateString.split("-");
+      if (parts.length !== 3) {
+        throw new Error(`Formato de fecha inválido: ${dateString}`);
+      }
+      const day = parts[0].padStart(2, "0");
+      const month = parts[1].padStart(2, "0");
+      const year = parts[2];
+      return `${year}-${month}-${day}`;
+    }
+
     try {
+      // Convertir fechas al formato correcto
+      const formattedStartDate = formatDateForAPI(startDate);
+      const formattedEndDate = formatDateForAPI(endDate);
+
       // Obtener el token de la tienda desde Firestore
       const tiendaDoc = await db
           .collection("tiendas")
@@ -864,8 +872,8 @@ exports.crearCuponTiendaNube = functions.https.onRequest((req, res) => {
         type: "absolute",
         value: value,
         max_uses: 1,
-        start_date: startDate,
-        end_date: endDate,
+        start_date: formattedStartDate,
+        end_date: formattedEndDate,
       });
 
       const options = {
@@ -918,10 +926,19 @@ exports.crearCuponTiendaNube = functions.https.onRequest((req, res) => {
       request.end();
     } catch (error) {
       console.error("Error generando cupón:", error);
-      res.status(500).json({
-        messageCF: "Error del servidor",
-        error: error.message,
-      });
+      // Si el error es de formato de fecha, devolver un mensaje más específico
+      if (error.message.includes("Formato de fecha inválido")) {
+        res.status(400).json({
+          messageCF: "Error en el formato de fecha",
+          error: error.message,
+          formatoEsperado: "DD-M-YYYY (ejemplo: 18-7-2025)",
+        });
+      } else {
+        res.status(500).json({
+          messageCF: "Error del servidor",
+          error: error.message,
+        });
+      }
     }
   });
 });
